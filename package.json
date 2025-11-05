@@ -1,0 +1,23 @@
+{
+  "name": "eth-event-watcher",
+  "version": "0.1.0",
+  "description": "Simple TypeScript watcher that monitors an ERC20 balance and triggers a follow-up transaction.",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p .",
+    "start": "ts-node src/index.ts",
+    "lint": "eslint . --ext .ts"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "ethers": "^6.13.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "eslint": "^9.11.1",
+    "@typescript-eslint/eslint-plugin": "^8.8.1",
+    "@typescript-eslint/parser": "^8.8.1",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.5"
+  }
+}
