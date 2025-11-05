@@ -1,9 +1,34 @@
 import { config } from "dotenv";
 import { Contract, JsonRpcProvider, Wallet, formatUnits } from "ethers";
+import { createWriteStream } from "node:fs";
+import type { WriteStream } from "node:fs";
 import readline from "node:readline";
 import { stdin as input, stdout as output } from "node:process";
+import { format as formatLog } from "node:util";
 
 config();
+
+const LOG_FILE_PATH = process.env.LOG_FILE ?? "watcher.log";
+const logStream = createWriteStream(LOG_FILE_PATH, { flags: "a" });
+
+process.once("exit", () => {
+  logStream.end();
+});
+
+type LogLevel = "INFO" | "ERROR";
+
+function writeLog(stream: WriteStream, level: LogLevel, message: string): void {
+  const timestamp = new Date().toISOString();
+  const line = `[${timestamp}] [${level}] ${message}`;
+
+  if (level === "ERROR") {
+    console.error(line);
+  } else {
+    console.log(line);
+  }
+
+  stream.write(`${line}\n`);
+}
 
 // Minimal IERC4626 ABI to support balance checks and vault withdrawals.
 const IERC4626_ABI = [
@@ -21,11 +46,12 @@ interface EventWatcherConfig {
   rpcUrl: string;
   privateKey: string;
   tokenAddress: string;
+  chainId: number;
   monitorAddress?: string;
   destinationAddress: string;
   pollIntervalMs?: number;
+  logStream: WriteStream;
 }
-
 async function promptPrivateKey(): Promise<string> {
   const rl = readline.createInterface({ input, output });
 
@@ -49,23 +75,31 @@ class EthEventWatcher {
   private cachedSymbol?: string;
   private isProcessing = false;
   private intervalId?: NodeJS.Timeout;
+  private logStream: WriteStream;
+  private chainId: number;
 
   constructor(config: EventWatcherConfig) {
     this.validateConfig(config);
 
-    this.provider = new JsonRpcProvider(config.rpcUrl);
+    this.chainId = config.chainId;
+    this.provider = new JsonRpcProvider(config.rpcUrl, config.chainId);
     this.wallet = new Wallet(config.privateKey, this.provider);
     this.monitorAddress = (config.monitorAddress ?? this.wallet.address).toLowerCase();
     this.destinationAddress = config.destinationAddress;
     this.pollIntervalMs = config.pollIntervalMs ?? 15000;
+    this.logStream = config.logStream;
 
-  this.token = new Contract(config.tokenAddress, IERC4626_ABI, this.provider);
+    this.token = new Contract(config.tokenAddress, IERC4626_ABI, this.provider);
     this.tokenWithSigner = this.token.connect(this.wallet) as Contract;
   }
 
   private validateConfig(config: EventWatcherConfig): void {
     if (!config.rpcUrl) {
       throw new Error("RPC_URL is required");
+    }
+
+    if (!Number.isInteger(config.chainId) || config.chainId <= 0) {
+      throw new Error("CHAIN_ID must be a positive integer");
     }
 
     if (!config.privateKey) {
@@ -91,7 +125,7 @@ class EthEventWatcher {
         this.cachedSymbol = await this.token.symbol();
       } catch (error) {
         this.cachedSymbol = "ERC20";
-        console.warn("Falling back to generic token symbol", error);
+        this.log("Falling back to generic token symbol: %o", error);
       }
     }
   }
@@ -112,8 +146,11 @@ class EthEventWatcher {
           ? formatUnits(withdrawableAssets, this.cachedDecimals)
           : withdrawableAssets.toString();
 
-        console.log(
-          `Detected ${formattedAssets} ${this.cachedSymbol ?? "assets"} withdrawable for ${this.monitorAddress}. Initiating vault withdraw...`
+        this.log(
+          "Detected %s %s withdrawable for %s. Initiating vault withdraw...",
+          formattedAssets,
+          this.cachedSymbol ?? "assets",
+          this.monitorAddress
         );
 
         const tx = await this.tokenWithSigner.withdraw(
@@ -121,22 +158,22 @@ class EthEventWatcher {
           this.destinationAddress,
           this.monitorAddress
         );
-        console.log(`Submitted withdraw tx ${tx.hash}`);
+        this.log("Submitted withdraw tx %s", tx.hash);
 
         const receipt = await tx.wait();
-        console.log(`Withdraw confirmed in block ${receipt.blockNumber}`);
+        this.log("Withdraw confirmed in block %d", receipt.blockNumber);
       } else {
-        console.log(`No withdrawable assets for ${this.monitorAddress}, skipping action.`);
+        this.log("No withdrawable assets for %s, skipping action.", this.monitorAddress);
       }
     } catch (error) {
-      console.error("Error while checking balance or submitting transaction", error);
+      this.logError("Error while checking balance or submitting transaction", error);
     } finally {
       this.isProcessing = false;
     }
   }
 
   public async start(): Promise<void> {
-    console.log(`Monitoring ${this.token.target} for ${this.monitorAddress}`);
+    this.log("Monitoring %s for %s on chain %d", this.token.target, this.monitorAddress, this.chainId);
 
     await this.checkBalanceAndAct();
 
@@ -150,8 +187,20 @@ class EthEventWatcher {
     if (this.intervalId) {
       clearInterval(this.intervalId);
       this.intervalId = undefined;
-      console.log("Event watcher stopped");
+      this.log("Event watcher stopped");
     }
+  }
+
+  private log(message: string, ...args: unknown[]): void {
+    writeLog(this.logStream, "INFO", formatLog(message, ...args));
+  }
+
+  private logError(message: string, error: unknown): void {
+    const errorDetails = error instanceof Error
+      ? error.stack ?? error.message
+      : formatLog("%o", error);
+
+    writeLog(this.logStream, "ERROR", `${message}: ${errorDetails}`);
   }
 }
 
@@ -159,6 +208,16 @@ async function main(): Promise<void> {
   const rpcUrl = process.env.RPC_URL;
   if (!rpcUrl) {
     throw new Error("RPC_URL is required");
+  }
+
+  const chainIdRaw = process.env.CHAIN_ID;
+  if (!chainIdRaw) {
+    throw new Error("CHAIN_ID is required");
+  }
+
+  const chainId = Number(chainIdRaw);
+  if (!Number.isInteger(chainId) || chainId <= 0) {
+    throw new Error("CHAIN_ID must be a positive integer");
   }
 
   const tokenAddress = process.env.TOKEN_ADDRESS;
@@ -182,15 +241,21 @@ async function main(): Promise<void> {
     rpcUrl,
     privateKey,
     tokenAddress,
+    chainId,
     monitorAddress: process.env.MONITOR_ADDRESS,
     destinationAddress,
-    pollIntervalMs
+    pollIntervalMs,
+    logStream,
   });
 
   await watcher.start();
 }
 
 void main().catch((error) => {
-  console.error("Fatal error in watcher", error);
+  const errorDetails = error instanceof Error
+    ? error.stack ?? error.message
+    : formatLog("%o", error);
+
+  writeLog(logStream, "ERROR", `Fatal error in watcher: ${errorDetails}`);
   process.exit(1);
 });
